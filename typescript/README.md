@@ -17,10 +17,14 @@ Python implementation.
 > **Status:** `crypto`, `models`, `issuance`, and `verification` are implemented
 > and validated byte-for-byte (issuance) and verdict-for-verdict (verification)
 > against Python-generated conformance vectors
-> ([`../test-vectors/vectors.json`](../test-vectors)). The vitest suite (183
-> tests) replays every shared golden vector — asserting Python's exact error
-> strings — plus TS-specific parity, fail-closed hardening, an isomorphic
-> (Buffer-free) runtime test, and end-to-end issue→verify round-trip tests.
+> ([`../test-vectors/vectors.json`](../test-vectors)). The vitest suite (276
+> tests) replays every shared golden vector — asserting byte-for-byte the 11
+> error strings those vectors pin — plus TS-specific parity, fail-closed
+> hardening, an isomorphic (Buffer-free) runtime test, and end-to-end
+> issue→verify round-trip tests. Diagnostics outside those 11 are TS-native and
+> intentionally not byte-identical to Python (see `src/verification/chain.ts`).
+> CI runs the whole suite on Node 20 and 22, and both runtimes produce
+> identical verdicts.
 
 ## Install & test
 
@@ -121,7 +125,12 @@ fail-closed (`valid: false` + a populated `errors` list):
   key named in the L3 header.
 - **Headers** — `alg` pinned to ES256 and `typ` checked per layer and mode.
 - **`_sd_alg`** — must be `sha-256` when present, at all layers.
-- **Duplicate `_sd` digests** — rejected per RFC 9901 §7.1 at all layers.
+- **Duplicate `_sd` digests** — rejected per RFC 9901 §7.1 at all layers. This
+  is the only §7.1 processing rule enforced today; see
+  [Standards scope](#standards-scope) for the ones that are not.
+- **Canonical base64url** — every segment and disclosure must be unpadded
+  RFC 4648 §5 with no out-of-alphabet characters, so a decoder cannot be talked
+  into accepting two spellings of the same bytes.
 - **Time claims** — `exp` / `iat` validated against a configurable
   `clockSkewSeconds` (default 300s); malformed time claims fail closed.
 - **L1↔L2 binding** — L2 `sd_hash` must match the presented L1 serialized form;
@@ -222,3 +231,34 @@ deterministically.
 
 The conformance vectors are regenerated from the Python reference with
 `python/scripts/generate_vectors.py`. License: Apache-2.0.
+
+## Standards scope
+
+This package implements the **Verifiable Intent profile** of SD-JWT, matching
+the Python reference. It is **not** a general-purpose SD-JWT library — if you
+need one, use [`@sd-jwt/core`](https://github.com/openwallet-foundation/sd-jwt-js).
+VI is hand-rolled here because the format diverges from plain RFC 9901 in ways a
+generic library cannot express, and because the golden vectors demand
+byte-identical output with Python's `json.dumps(separators=(",", ":"))`:
+
+- Holder binding lives in the SD-JWT payload as `sd_hash`, not in a trailing
+  KB-JWT, and the layer `typ` values are `sd+jwt` / `kb-sd-jwt` / `kb-sd-jwt+kb`
+  rather than `kb+jwt`.
+- `delegate_payload` carries `{"...": "<digest>"}` references at the top level
+  of the payload; RFC 9901 uses that form only for array elements.
+
+Consequently, several RFC 9901 §7 verifier rules are **not** enforced. They are
+tracked as spec work, and both implementations behave the same way today:
+
+| RFC 9901 rule | Status |
+| --- | --- |
+| §7.1 duplicate digest in `_sd` MUST be rejected | **enforced** |
+| §7.1 unreferenced disclosure MUST be rejected | not enforced (extra disclosures are ignored) |
+| §7.1 claim name `_sd` / `...` MUST be rejected | not enforced |
+| §7.1 claim name colliding with an existing one MUST be rejected | not enforced (last presented wins) |
+| §7.3 KB-JWT verifier rules | not applicable — VI has no trailing KB-JWT. `verifyKbJwt` is an interoperability helper that checks **only** the signature; it does not check `typ`, `sd_hash`, `aud`, or `nonce`, and is not used by `verifyChain`. |
+
+`_sd_alg` is validated to be `sha-256` when present, but is not required to be
+present. Autonomous mode does not recompute `checkout_hash` from `checkout_jwt`
+(only the L3a↔L3b cross-reference equality is checked); see
+[`spec/credential-format.md`](../spec/credential-format.md) §6.2.

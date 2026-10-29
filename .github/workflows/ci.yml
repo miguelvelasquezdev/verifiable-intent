@@ -57,13 +57,18 @@ jobs:
     defaults:
       run:
         working-directory: typescript
+    strategy:
+      matrix:
+        # 20 is the `engines` floor and the WebCrypto baseline the isomorphic
+        # build targets; 22 is current LTS. Both must stay green.
+        node-version: ["20", "22"]
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: ${{ matrix.node-version }}
           cache: npm
           cache-dependency-path: typescript/package-lock.json
 
@@ -81,3 +86,14 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      # Guards the published package's exports/types map. Without it a broken
+      # exports field only surfaces after publish.
+      - name: Check package publishability
+        run: npm run check:pkg
+
+      # Runs issue -> verify -> resolve through both the ESM and CJS bundles
+      # with `Buffer` deleted, so the "zero runtime deps, browser-ready" claim
+      # is regression-tested rather than asserted.
+      - name: Isomorphic (no-Buffer) check
+        run: node scripts/isomorphic-check.mjs

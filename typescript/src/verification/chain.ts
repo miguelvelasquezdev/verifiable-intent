@@ -4,10 +4,20 @@
  * This file — including its 500+-line `verifyChain` and its numbered step
  * sequence — deliberately mirrors
  * python/src/verifiable_intent/verification/chain.py line-for-line for
- * auditability. Both the control flow AND the `result.errors` strings must stay
- * byte-for-byte identical to the Python reference; several of those error
- * strings are pinned by the shared golden vectors in test-vectors/vectors.json.
- * Refactor only alongside a matching change on the Python side.
+ * auditability. The control flow — which check runs in which order, and which
+ * one wins on a credential that fails several — must stay identical to the
+ * reference. Refactor only alongside a matching change on the Python side.
+ *
+ * ERROR STRINGS: the 11 messages pinned by the shared golden vectors in
+ * test-vectors/vectors.json are byte-for-byte identical to Python and are
+ * asserted as such by verification.test.ts — never reword one without
+ * regenerating the vectors. The rest are TS-native diagnostics and deliberately
+ * are NOT byte-identical: they render `typeof` and `String()`, not Python's
+ * `type(v).__name__` and `str(v)`, because reporting `dict` / `NoneType` to a
+ * caller writing TypeScript describes their data in the wrong language. Nothing
+ * compares those strings across implementations. If cross-implementation
+ * diagnostics are ever wanted, add stable machine-readable error codes rather
+ * than mirroring Python's rendering.
  */
 
 import { hashAscii, hashDisclosure } from '../crypto/disclosure.js';
@@ -15,6 +25,7 @@ import { type SdJwt, resolveDisclosures, verifySdJwtSignature } from '../crypto/
 import type { Es256Jwk } from '../crypto/signing.js';
 import type { JsonObject, KnownConstraintType } from '../models/constraints.js';
 import { asArray, isJsonObject } from '../internal/guards.js';
+import { isFloatSpelled } from '../internal/float-spelled.js';
 import { verifyCheckoutHashBinding, verifyL2ReferenceBinding, verifyL3CrossReference } from './integrity.js';
 
 const ALLOWED_ALGS = new Set(['ES256']);
@@ -175,10 +186,19 @@ interface MandatePairCheck {
   checksSkipped: string[];
 }
 
-/** The agent delegation key resolved from the L2 open mandates, or an error if inconsistent. */
+/**
+ * The agent delegation key resolved from the L2 open mandates, or an error if
+ * inconsistent.
+ *
+ * `kid` is `unknown`, not `string`: Python takes `jwk.get("kid")` at face value,
+ * so a mandate that pins a NON-string kid still pins the binding (and can never
+ * equal the L3 header's string kid, so the chain is rejected). Narrowing to
+ * `string | null` here would silently turn such a mandate into "no kid pinned"
+ * and skip the check entirely — fail-open where Python fails closed.
+ */
 interface AgentKeyResult {
   jwk: JsonObject | null;
-  kid: string | null;
+  kid: unknown;
   error: string | null;
 }
 
@@ -722,8 +742,11 @@ export async function verifyChain(l1: SdJwt, l2: SdJwt, opts: VerifyChainOptions
           result.errors.push(`${label} header missing required kid parameter`);
           return result;
         }
+        // `agentKid` is `unknown`: a non-string kid pinned in L2 can never equal
+        // the L3 header's string kid, so the chain is rejected — matching Python
+        // rather than silently skipping the binding check.
         if (agentKid !== null && l3HeaderKid !== agentKid) {
-          result.errors.push(`${label} header kid '${l3HeaderKid}' does not match L2 cnf.jwk.kid '${agentKid}'`);
+          result.errors.push(`${label} header kid '${l3HeaderKid}' does not match L2 cnf.jwk.kid '${String(agentKid)}'`);
           return result;
         }
 
@@ -791,7 +814,9 @@ function validatePaymentMandateRequiredFields(mandate: JsonObject, context: stri
   if (!isNonEmptyString(paymentAmount.currency)) return `${context} payment_amount missing required field: currency`;
   const amount = paymentAmount.amount;
   if (amount === undefined || amount === null) return `${context} payment_amount missing required field: amount`;
-  if (typeof amount === 'boolean' || !Number.isInteger(amount)) {
+  // `isFloatSpelled` restores the int/float distinction JSON.parse discards:
+  // Python's `isinstance(amount, int)` rejects `27999.0`, and so must this.
+  if (typeof amount === 'boolean' || !Number.isInteger(amount) || isFloatSpelled(paymentAmount, 'amount')) {
     return `${context} payment_amount field 'amount' must be an integer`;
   }
 
@@ -1078,7 +1103,8 @@ async function verifyMandatePair(
 
 function extractAgentKeyFromAllPairs(mandatePairs: MandatePair[]): AgentKeyResult {
   const agentKeys: JsonObject[] = [];
-  const agentKids: (string | null)[] = [];
+  // `unknown`, not `string` — see AgentKeyResult.kid.
+  const agentKids: unknown[] = [];
 
   for (const [checkoutInfo, paymentInfo] of mandatePairs) {
     for (const [label, info, expectedVct] of [
@@ -1093,7 +1119,9 @@ function extractAgentKeyFromAllPairs(mandatePairs: MandatePair[]): AgentKeyResul
         return { jwk: null, kid: null, error: `L2 ${label} open mandate missing cnf.jwk for agent delegation` };
       }
       agentKeys.push(jwk);
-      agentKids.push(typeof jwk.kid === 'string' ? jwk.kid : null);
+      // Python: `kid = jwk.get("kid")` — absent (and JSON null) mean "not
+      // pinned"; ANY other value pins the binding, whatever its type.
+      agentKids.push(jwk.kid ?? null);
     }
   }
 
@@ -1107,7 +1135,7 @@ function extractAgentKeyFromAllPairs(mandatePairs: MandatePair[]): AgentKeyResul
     }
   }
 
-  const [firstKid, ...restKids] = agentKids.filter((k): k is string => k !== null);
+  const [firstKid, ...restKids] = agentKids.filter((k) => k !== null);
   if (firstKid !== undefined) {
     for (const otherKid of restKids) {
       if (otherKid !== firstKid) {

@@ -20,9 +20,10 @@
  * value change falls back to the strict `compactJson` path and the signature
  * check fails, exactly as it does in Python.
  *
- * On runtimes without `JSON.parse` source access (pre-V8 12 / Node < 21),
- * {@link parsePySegment} returns null and callers keep today's stricter
- * behavior (such credentials verify as false instead of matching Python).
+ * The lexemes come from a self-contained RFC 8259 parser rather than
+ * `JSON.parse` reviver source access, so the behavior is identical on every
+ * supported runtime — including Node 20 (this package's `engines` floor) and
+ * non-V8 browsers, where source access does not exist.
  */
 
 import { asciiEscape } from './json.js';
@@ -35,20 +36,6 @@ class PyNum {
   ) {}
 }
 
-// Feature-detect JSON.parse source access (the `context` reviver parameter).
-const HAS_SOURCE_ACCESS = ((): boolean => {
-  let seen = false;
-  try {
-    JSON.parse('1', ((_k: string, v: unknown, ctx?: { source?: string }) => {
-      seen = typeof ctx?.source === 'string';
-      return v;
-    }) as unknown as (key: string, value: unknown) => unknown);
-  } catch {
-    return false;
-  }
-  return seen;
-})();
-
 export interface ParsedSegment {
   /** The parsed value, identical to what `JSON.parse(text)` yields. */
   value: unknown;
@@ -58,21 +45,215 @@ export interface ParsedSegment {
 
 /**
  * Parse a JSON segment and compute its Python-compact re-serialization.
- * Returns null when the runtime lacks source access or the text is not JSON.
+ * Returns null when the text is not valid JSON.
  */
 export function parsePySegment(text: string): ParsedSegment | null {
-  if (!HAS_SOURCE_ACCESS) return null;
   let tree: unknown;
   try {
-    tree = JSON.parse(text, ((_k: string, v: unknown, ctx?: { source?: string }) =>
-      typeof v === 'number' && typeof ctx?.source === 'string' ? new PyNum(v, ctx.source) : v) as unknown as (
-      key: string,
-      value: unknown,
-    ) => unknown);
+    tree = parseCapturingNumbers(text);
   } catch {
     return null;
   }
   return walk(tree);
+}
+
+/**
+ * RFC 8259 parser that keeps each number's original lexeme.
+ *
+ * `JSON.parse` reviver source access would give the same thing in one line, but
+ * it needs V8 12 (Node >= 21) and is absent on Node 20 — this package's
+ * `engines` floor — and on non-V8 browsers. There, `parsePySegment` used to
+ * return null and every credential carrying `1.0` or an integer beyond 2^53
+ * silently failed signature verification, so the "byte-compatible with Python"
+ * guarantee held only on new V8. Parsing the text here makes the behavior
+ * identical on every supported runtime.
+ *
+ * Accepts exactly what `JSON.parse` accepts (see the differential test in
+ * test/crypto-parity.test.ts) and preserves object key insertion order, which
+ * Python's `json.dumps` relies on. Duplicate keys resolve last-wins, as in both
+ * `JSON.parse` and Python's `json.loads`.
+ */
+function parseCapturingNumbers(text: string): unknown {
+  let i = 0;
+
+  const fail = (msg: string): never => {
+    throw new SyntaxError(`${msg} at position ${i}`);
+  };
+
+  const ws = (): void => {
+    while (i < text.length) {
+      const c = text.charCodeAt(i);
+      if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) i++;
+      else break;
+    }
+  };
+
+  const literal = (word: string, value: unknown): unknown => {
+    if (text.startsWith(word, i)) {
+      i += word.length;
+      return value;
+    }
+    return fail(`Unexpected token '${text[i] ?? ''}'`);
+  };
+
+  const string = (): string => {
+    if (text[i] !== '"') fail('Expected string');
+    i++;
+    let out = '';
+    for (;;) {
+      if (i >= text.length) fail('Unterminated string');
+      const c = text[i]!;
+      if (c === '"') {
+        i++;
+        return out;
+      }
+      if (c === '\\') {
+        i++;
+        const e = text[i];
+        i++;
+        switch (e) {
+          case '"':
+            out += '"';
+            break;
+          case '\\':
+            out += '\\';
+            break;
+          case '/':
+            out += '/';
+            break;
+          case 'b':
+            out += '\b';
+            break;
+          case 'f':
+            out += '\f';
+            break;
+          case 'n':
+            out += '\n';
+            break;
+          case 'r':
+            out += '\r';
+            break;
+          case 't':
+            out += '\t';
+            break;
+          case 'u': {
+            const hex = text.slice(i, i + 4);
+            if (!/^[0-9a-fA-F]{4}$/.test(hex)) fail('Invalid \\u escape');
+            out += String.fromCharCode(parseInt(hex, 16));
+            i += 4;
+            break;
+          }
+          default:
+            fail('Invalid escape');
+        }
+        continue;
+      }
+      // RFC 8259: unescaped control characters are not allowed in strings.
+      if (text.charCodeAt(i) < 0x20) fail('Unescaped control character in string');
+      out += c;
+      i++;
+    }
+  };
+
+  const number = (): PyNum => {
+    const start = i;
+    if (text[i] === '-') i++;
+    if (text[i] === '0') {
+      i++;
+    } else if (text[i] !== undefined && text[i]! >= '1' && text[i]! <= '9') {
+      while (text[i] !== undefined && text[i]! >= '0' && text[i]! <= '9') i++;
+    } else {
+      fail('Invalid number');
+    }
+    if (text[i] === '.') {
+      i++;
+      if (!(text[i] !== undefined && text[i]! >= '0' && text[i]! <= '9')) fail('Invalid fraction');
+      while (text[i] !== undefined && text[i]! >= '0' && text[i]! <= '9') i++;
+    }
+    if (text[i] === 'e' || text[i] === 'E') {
+      i++;
+      if (text[i] === '+' || text[i] === '-') i++;
+      if (!(text[i] !== undefined && text[i]! >= '0' && text[i]! <= '9')) fail('Invalid exponent');
+      while (text[i] !== undefined && text[i]! >= '0' && text[i]! <= '9') i++;
+    }
+    const source = text.slice(start, i);
+    return new PyNum(Number(source), source);
+  };
+
+  const array = (): unknown[] => {
+    i++; // '['
+    const out: unknown[] = [];
+    ws();
+    if (text[i] === ']') {
+      i++;
+      return out;
+    }
+    for (;;) {
+      ws();
+      out.push(value());
+      ws();
+      if (text[i] === ',') {
+        i++;
+        continue;
+      }
+      if (text[i] === ']') {
+        i++;
+        return out;
+      }
+      fail("Expected ',' or ']'");
+    }
+  };
+
+  const object = (): Record<string, unknown> => {
+    i++; // '{'
+    const out: Record<string, unknown> = {};
+    ws();
+    if (text[i] === '}') {
+      i++;
+      return out;
+    }
+    for (;;) {
+      ws();
+      const key = string();
+      ws();
+      if (text[i] !== ':') fail("Expected ':'");
+      i++;
+      ws();
+      // Plain assignment: a duplicate key takes the LAST value but keeps its
+      // FIRST position, which is what both JSON.parse and Python's json.loads
+      // do (and key order is part of the re-serialized bytes).
+      out[key] = value();
+      ws();
+      if (text[i] === ',') {
+        i++;
+        continue;
+      }
+      if (text[i] === '}') {
+        i++;
+        return out;
+      }
+      fail("Expected ',' or '}'");
+    }
+  };
+
+  function value(): unknown {
+    const c = text[i];
+    if (c === undefined) return fail('Unexpected end of input');
+    if (c === '{') return object();
+    if (c === '[') return array();
+    if (c === '"') return string();
+    if (c === 't') return literal('true', true);
+    if (c === 'f') return literal('false', false);
+    if (c === 'n') return literal('null', null);
+    if (c === '-' || (c >= '0' && c <= '9')) return number();
+    return fail(`Unexpected token '${c}'`);
+  }
+
+  ws();
+  const result = value();
+  ws();
+  if (i !== text.length) fail('Unexpected trailing content');
+  return result;
 }
 
 function walk(node: unknown): ParsedSegment {

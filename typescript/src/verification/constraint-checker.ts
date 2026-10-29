@@ -13,6 +13,7 @@ import {
 } from '../models/constraints.js';
 import type { JsonObject } from '../models/constraints.js';
 import { isJsonObject } from '../internal/guards.js';
+import { isFloatSpelled } from '../internal/float-spelled.js';
 
 export const StrictnessMode = {
   PERMISSIVE: 'permissive', // skip unknown constraint types
@@ -152,9 +153,18 @@ function checkPaymentAmount(c: PaymentAmountConstraint, fulfillment: JsonObject,
     result.violations.push('Missing amount in fulfillment payment_amount');
     return;
   }
-  if (typeof amountRaw === 'boolean' || !isInt(amountRaw)) {
+  // `isFloatSpelled` restores the int/float split JSON.parse discards: the spec
+  // requires an integer in minor units, and `27999.0` is not one even though
+  // `Number.isInteger` says otherwise once the lexeme is gone. (The constraint's
+  // own min/max arrive via a parsed Constraint instance, which does not carry the
+  // raw object identity the tag is keyed on — they stay on the isInt check.)
+  const amountIsFloat = isFloatSpelled(paymentAmount, 'amount');
+  if (typeof amountRaw === 'boolean' || !isInt(amountRaw) || amountIsFloat) {
     result.satisfied = false;
-    result.violations.push(`Invalid amount: must be an integer, got ${typeof amountRaw}: ${JSON.stringify(amountRaw)}`);
+    const detail = amountIsFloat
+      ? `a number written with a decimal point or exponent: ${JSON.stringify(amountRaw)}`
+      : `${typeof amountRaw}: ${JSON.stringify(amountRaw)}`;
+    result.violations.push(`Invalid amount: must be an integer, got ${detail}`);
     return;
   }
   const actual = amountRaw;

@@ -1,6 +1,7 @@
 /** SD-JWT selective-disclosure utilities, matching the Python reference byte-for-byte. */
 
 import { asciiBytes, b64urlDecode, b64urlEncode, utf8, utf8Decode } from './base64url.js';
+import { floatSpelledKeys, tagFloatSpelled } from '../internal/float-spelled.js';
 import { compactJson } from './json.js';
 
 /** A delegate-payload reference: `{"...": "<disclosure-hash>"}`. */
@@ -33,13 +34,17 @@ export async function createDisclosure(claimName: string | null, claimValue: unk
 }
 
 export function decodeDisclosure(disclosureB64: string): DecodedDisclosure {
-  // Route through b64urlDecode so impossible base64 lengths and non-ASCII input
-  // are rejected, matching Python's urlsafe_b64decode.
-  const parsed = JSON.parse(utf8Decode(b64urlDecode(disclosureB64))) as unknown;
+  // Route through b64urlDecode so non-canonical base64url is rejected.
+  const text = utf8Decode(b64urlDecode(disclosureB64));
+  const parsed = JSON.parse(text) as unknown;
   // Per SD-JWT, a disclosure is [salt, value] (array element) or [salt, name, value] (object property).
   if (!Array.isArray(parsed) || (parsed.length !== 2 && parsed.length !== 3)) {
     throw new Error('Invalid disclosure: expected a 2- or 3-element array');
   }
+  // `JSON.parse` collapses `27999.0` to `27999`; record which keys were written
+  // as floats so the verifier can reject them exactly where Python's
+  // `isinstance(x, int)` does. See internal/float-spelled.ts.
+  tagFloatSpelled(parsed, floatSpelledKeys(text));
   return parsed as DecodedDisclosure;
 }
 

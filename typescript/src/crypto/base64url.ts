@@ -39,40 +39,58 @@ export function b64urlEncode(data: Uint8Array): string {
   return out;
 }
 
+/**
+ * Decode canonical unpadded base64url (RFC 4648 §5) — strictly.
+ *
+ * Every character must be in the alphabet (base64url `-_`, plus the standard
+ * `+/` that Python's `urlsafe_b64decode` also accepts), and the length must not
+ * be 1 more than a multiple of 4 (an impossible base64 length). Padding (`=`)
+ * and any other out-of-alphabet character are rejected outright.
+ *
+ * This is deliberately STRICTER than Python's `urlsafe_b64decode`, which
+ * inherits `binascii`'s lenient mode: it silently discards out-of-alphabet
+ * characters and accepts padding, so `"AAAA$A"` and a valid disclosure with a
+ * `$` spliced into it decode to *something* rather than failing. Emulating that
+ * bug-for-bug is not worth doing — the two decoders disagree in both directions
+ * (which input is rejected depends on `len % 4` and where the junk lands), and
+ * a verifier accepting non-canonical encodings is exactly the canonicalization
+ * ambiguity the VI security model warns about:
+ *
+ *   "Use base64url encoding without padding (RFC 4648 §5). SHOULD reject padded
+ *    input during verification to prevent canonicalization mismatches."
+ *   — spec/security-model.md §5.1
+ *
+ * Rejecting a superset of what Python rejects is fail-closed: no credential
+ * that the Python reference refuses is accepted here. Both implementations
+ * *emit* canonical unpadded base64url, so every well-formed VI credential —
+ * including every golden vector — round-trips unchanged.
+ */
 export function b64urlDecode(s: string): Uint8Array {
-  // Match Python's `urlsafe_b64decode` (after its padding fixup), which raises
-  // on a length that is 1 more than a multiple of 4 (an impossible base64
-  // length). Lenient decoders would otherwise silently return empty/garbage
-  // bytes for such input.
   if (s.length % 4 === 1) {
     throw new Error(`Invalid base64url string: length ${s.length} is not a valid base64 length`);
   }
-  // Python's `urlsafe_b64decode(str)` first does `.encode('ascii')`, raising on
-  // any non-ASCII character. Lenient decoders would silently skip them as
-  // non-alphabet.
+  // Checked before the alphabet scan so non-ASCII input reports the more
+  // specific message (parity with Python's `.encode('ascii')` failure).
   if (NON_ASCII_CHAR.test(s)) {
     throw new Error('Invalid base64url string: contains non-ASCII characters');
   }
-  // Lenient core, byte-compatible with the previous Node-Buffer decoder (which
-  // the parity tests pin): non-alphabet ASCII characters are skipped, decoding
-  // stops at the first '=' padding character, and a trailing partial byte is
-  // dropped.
-  const out: number[] = [];
+  const out = new Uint8Array((s.length * 3) >> 2);
+  let n = 0;
   let acc = 0;
   let bits = 0;
   for (let i = 0; i < s.length; i++) {
-    const code = s.charCodeAt(i);
-    if (code === 0x3d) break; // '=': padding — stop decoding.
-    const value = DECODE_TABLE[code] ?? -1;
-    if (value < 0) continue;
+    const value = DECODE_TABLE[s.charCodeAt(i)] ?? -1;
+    if (value < 0) {
+      throw new Error(`Invalid base64url string: unexpected character '${s[i]}' at index ${i}`);
+    }
     acc = (acc << 6) | value;
     bits += 6;
     if (bits >= 8) {
       bits -= 8;
-      out.push((acc >> bits) & 0xff);
+      out[n++] = (acc >> bits) & 0xff;
     }
   }
-  return new Uint8Array(out);
+  return out.subarray(0, n);
 }
 
 /** UTF-8 encode a string to bytes (compact JSON is ASCII, so this equals the ASCII bytes). */
